@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Live Fact Checker</title>
+    <style>
+        body { font-family: system-ui; max-width: 600px; margin: 2rem auto; padding: 1rem; background: #f4f4f5; }
+        .card { padding: 1rem; border-radius: 8px; margin-bottom: 1rem; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .TRUE { background: #dcfce7; border-left: 5px solid #22c55e; }
+        .FALSE { background: #fee2e2; border-left: 5px solid #ef4444; }
+        .NUANCE { background: #fef9c3; border-left: 5px solid #eab308; }
+        button { padding: 10px 20px; font-size: 16px; cursor: pointer; margin-bottom: 20px; }
+    </style>
+</head>
+<body>
+    <h1>Real-Time Fact Checker</h1>
+    <button id="startBtn">Start Listening</button>
+    <div id="status">Status: Disconnected</div>
+    <div id="cards-container"></div>
+
+    <script>
+        let ws;
+        let mediaRecorder;
+
+        document.getElementById('startBtn').onclick = async () => {
+            // 1. Open WebSocket
+            ws = new WebSocket('ws://localhost:8000/listen');
+            
+            ws.onopen = () => document.getElementById('status').innerText = "Status: Connected & Listening";
+            
+            // 2. Receive JSON from Backend and render UI
+            ws.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                const container = document.getElementById('cards-container');
+                
+                const card = document.createElement('div');
+                card.className = `card ${data.status}`;
+                card.innerHTML = `
+                    <strong>Claim:</strong> ${data.claim} <br>
+                    <strong>Verdict:</strong> ${data.status} <br>
+                    <small>${data.reason}</small>
+                `;
+                container.prepend(card); // Add newest cards to the top
+            };
+
+            // 3. Capture Microphone
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
+            
+            // 4. Send audio chunk to server every 1000ms
+            mediaRecorder.ondataavailable = (event) => {
+                if (event.data.size > 0 && ws.readyState === WebSocket.OPEN) {
+                    ws.send(event.data);
+                }
+            };
+            
+            mediaRecorder.start(1000);
+            document.getElementById('startBtn').disabled = true;
+        };
+    </script>
+</body>
+</html>
