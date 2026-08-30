@@ -3,8 +3,10 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from contextlib import asynccontextmanager
 import os
+
 from dotenv import load_dotenv
 from deepgram import DeepgramClient, LiveTranscriptionEvents, LiveOptions
+from engine import verify_claims
 
 # Loads the variables from your .env file into the system
 load_dotenv()
@@ -21,63 +23,81 @@ outbound_queue = asyncio.Queue()
 # 2. Define the Background Workers (The "Chefs")
 async def transcription_worker():
     """Pulls raw audio from the queue and streams it to Deepgram."""
+    dg_connection = None
+
     try:
-        # 1. Create the Deepgram live connection
-        dg_connection = deepgram.listen.asyncwebsocket.v("1")
-
-        # 2. Define what happens when Deepgram returns text
-        async def on_message(self, result, **kwargs):
-            sentence = result.channel.alternatives[0].transcript
-            if sentence:  # Only process if there are actual words
-                print(f"📝 Deepgram heard: '{sentence}'")
-                await text_queue.put(sentence)
-
-        # Bind the handler to the Transcript event
-        dg_connection.on(LiveTranscriptionEvents.Transcript, on_message)
-
-        # 3. Start the connection with the Nova-2 model
-        options = LiveOptions(
-            model="nova-2",
-            language="en-US",
-            smart_format=True,
-        )
-        
-        if await dg_connection.start(options) is False:
-            print("Failed to connect to Deepgram")
-            return
-
-        print("Deepgram connection established!")
-
-        # 4. Loop forever: pull from our audio queue and send to Deepgram
         while True:
             audio_data = await audio_queue.get()
+            
+            # 1. Check for the kill signal (client disconnected)
+            if audio_data is None:
+                if dg_connection is not None:
+                    print("Closing Deepgram connection safely...")
+                    await dg_connection.finish()
+                    dg_connection = None
+                audio_queue.task_done()
+                continue
+
+            # 2. Initialize Deepgram ONLY when the first audio chunk arrives
+            if dg_connection is None:
+                dg_connection = deepgram.listen.asyncwebsocket.v("1")
+                
+                async def on_message(self, result, **kwargs):
+                    sentence = result.channel.alternatives[0].transcript
+                    if sentence:  
+                        print(f"📝 Deepgram heard: '{sentence}'")
+                        await text_queue.put(sentence)
+
+                dg_connection.on(LiveTranscriptionEvents.Transcript, on_message)
+
+                options = LiveOptions(
+                    model="nova-2",
+                    language="en-US",
+                    smart_format=True,
+                )
+                
+                if await dg_connection.start(options) is False:
+                    print("Failed to connect to Deepgram")
+                    dg_connection = None
+                    audio_queue.task_done()
+                    continue
+
+                print("Deepgram connection established!")
+
+            # 3. Send the actual audio data
             await dg_connection.send(audio_data)
             audio_queue.task_done()
 
+    except asyncio.CancelledError:
+        print("Shutting down Deepgram connection (CTRL+C)...")
+        if dg_connection:
+            await dg_connection.finish()
+            
     except Exception as e:
         print(f"Transcription worker error: {e}")
 
 async def ai_logic_worker():
-    """Simulates the RAG pipeline checking a claim."""
-    while True:
-        # 1. Wait for text to arrive from the transcription worker
-        text = await text_queue.get()
-        print(f"🧠 AI Worker evaluating: '{text}'...")
-        
-        # 2. Simulate API processing time (the bottleneck we are trying to avoid)
-        await asyncio.sleep(2)
-        
-        # 3. Create the fake result card
-        fake_result = {
-            "claim": text,
-            "status": "FALSE",
-            "reason": "Satellite imagery and physics confirm the Earth is an oblate spheroid."
-        }
-        
-        # 4. Push to the final queue for the WebSocket to send!
-        await outbound_queue.put(fake_result)
-        text_queue.task_done()
+    """Pulls text, delegates to engine.py, and pushes the result to outbound_queue."""
+    try:
+        while True:
+            # 1. Wait for text to arrive
+            text = await text_queue.get()
+            print(f"🧠 AI Worker evaluating: '{text}'...")
 
+            # 2. Process the text in its own isolated error block
+            try:
+                result_json = await verify_claims(text)
+                print(f"✅ Verdict ready: {result_json['status']}")
+                await outbound_queue.put(result_json)
+            except Exception as e:
+                print(f"AI Worker error: {e}")
+            finally:
+                # Only mark the task done if we successfully grabbed it from the queue
+                text_queue.task_done()
+
+    except asyncio.CancelledError:
+        # 3. Catch the CTRL+C shutdown signal and exit instantly
+        print("Shutting down AI Worker (CTRL+C)...")
 
 # 3. The Lifespan Manager: Boots the workers alongside the server
 @asynccontextmanager
@@ -89,18 +109,24 @@ async def lifespan(app: FastAPI):
     yield # The server runs and handles users here
     
     # Clean up when the server shuts down
+    print("Cancelling background tasks...")
     task1.cancel()
     task2.cancel()
+    
+    # Force FastAPI to wait for the tasks to gracefully close their connections
+    await asyncio.gather(task1, task2, return_exceptions=True)
+    print("All background tasks shut down completely.")
 
 # Initialize FastAPI with the lifespan
 app = FastAPI(lifespan=lifespan)
+
 @app.get("/")
 async def get_ui():
     with open("index.html", "r") as f:
         html_content = f.read()
     return HTMLResponse(html_content)
 
-# 4. The Gateway (The "Waiter")
+# 4. The Gateway
 @app.websocket("/listen")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
@@ -114,20 +140,32 @@ async def websocket_endpoint(websocket: WebSocket):
                 await audio_queue.put(data)
         except WebSocketDisconnect:
             print("Audio receive loop ended (client disconnected)")
+            await audio_queue.put(None) # Kill signal to transcription_worker
 
     async def send_results():
         """Pulls completed fact-check cards and pushes them to the client."""
         try:
             while True:
-                # Wait for the AI worker to produce a verified card
                 card_data = await outbound_queue.get()
                 await websocket.send_json(card_data)
                 outbound_queue.task_done()
         except WebSocketDisconnect:
             print("Send results loop ended")
+        except asyncio.CancelledError:
+            pass # Gracefully exit when the sibling task cancels this one
 
-    # Run both loops simultaneously on this connection
-    try:
-        await asyncio.gather(receive_audio(), send_results())
-    except WebSocketDisconnect:
-        print("WebSocket disconnected completely")
+    # Create distinct tasks for both loops
+    receive_task = asyncio.create_task(receive_audio())
+    send_task = asyncio.create_task(send_results())
+
+    # Wait for WHICHEVER task finishes/fails first
+    done, pending = await asyncio.wait(
+        [receive_task, send_task],
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+
+    # Instantly cancel the other task so it doesn't hang the server
+    for task in pending:
+        task.cancel()
+        
+    print("WebSocket disconnected completely")
