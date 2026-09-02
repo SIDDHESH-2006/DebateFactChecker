@@ -15,7 +15,7 @@ async def verify_claims(text: str) -> dict:
     context = "\n".join([result["content"] for result in search_result["results"]])
 
     prompt = f"""
-    You are a real-time fact-checker. Determine if the following claim is TRUE, FALSE, or NUANCE based on the provided context.
+    You are a real-time fact-checker. Determine if the following claim is TRUE, FALSE, or NUANCE based on the provided context. If the claim is not making a factual statement, assume it to be what the claim sounds most similar to
     Claim: {text}
     Context: {context}
     Respond ONLY with a valid JSON object in this exact format:

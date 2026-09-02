@@ -24,36 +24,56 @@ outbound_queue = asyncio.Queue()
 async def transcription_worker():
     """Pulls raw audio from the queue and streams it to Deepgram."""
     dg_connection = None
+    transcript_buffer = ""  # 1. Create a memory buffer for the paragraph
 
     try:
         while True:
             audio_data = await audio_queue.get()
             
-            # 1. Check for the kill signal (client disconnected)
+            # Check for the kill signal (client disconnected)
             if audio_data is None:
                 if dg_connection is not None:
                     print("Closing Deepgram connection safely...")
                     await dg_connection.finish()
                     dg_connection = None
+                # Clear the buffer on disconnect
+                transcript_buffer = ""
                 audio_queue.task_done()
                 continue
 
-            # 2. Initialize Deepgram ONLY when the first audio chunk arrives
+            # Initialize Deepgram ONLY when the first audio chunk arrives
             if dg_connection is None:
                 dg_connection = deepgram.listen.asyncwebsocket.v("1")
                 
                 async def on_message(self, result, **kwargs):
+                    nonlocal transcript_buffer  # 2. Let the handler modify our outside buffer
+                    
                     sentence = result.channel.alternatives[0].transcript
-                    if sentence:  
-                        print(f"📝 Deepgram heard: '{sentence}'")
-                        await text_queue.put(sentence)
+                    if not sentence:
+                        return
+
+                    # 3. Only keep finalized text blocks
+                    if result.is_final:
+                        transcript_buffer += sentence + " "
+                        
+                        # 4. "speech_final" triggers when Deepgram detects the 800ms pause
+                        if result.speech_final:
+                            complete_paragraph = transcript_buffer.strip()
+                            if complete_paragraph:
+                                print(f"📝 Completed Paragraph: '{complete_paragraph}'")
+                                await text_queue.put(complete_paragraph)
+                            
+                            # 5. Reset the buffer for the next time they speak
+                            transcript_buffer = ""
 
                 dg_connection.on(LiveTranscriptionEvents.Transcript, on_message)
 
+                # 6. Add endpointing (silence detection) to your options
                 options = LiveOptions(
                     model="nova-2",
                     language="en-US",
                     smart_format=True,
+                    endpointing=800, # Wait for 800ms of silence before concluding the thought
                 )
                 
                 if await dg_connection.start(options) is False:
@@ -64,7 +84,7 @@ async def transcription_worker():
 
                 print("Deepgram connection established!")
 
-            # 3. Send the actual audio data
+            # Send the actual audio data
             await dg_connection.send(audio_data)
             audio_queue.task_done()
 
