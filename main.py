@@ -24,56 +24,79 @@ outbound_queue = asyncio.Queue()
 async def transcription_worker():
     """Pulls raw audio from the queue and streams it to Deepgram."""
     dg_connection = None
-    transcript_buffer = ""  # 1. Create a memory buffer for the paragraph
+    transcript_buffer = ""
+    current_speaker = None  # <--- Track who is currently holding the floor
 
     try:
         while True:
             audio_data = await audio_queue.get()
             
-            # Check for the kill signal (client disconnected)
             if audio_data is None:
                 if dg_connection is not None:
                     print("Closing Deepgram connection safely...")
-                    await dg_connection.finish()
+                    try:
+                        await asyncio.wait_for(dg_connection.finish(), timeout=2.0)
+                    except Exception:
+                        pass
                     dg_connection = None
-                # Clear the buffer on disconnect
+                
                 transcript_buffer = ""
+                current_speaker = None
                 audio_queue.task_done()
                 continue
 
-            # Initialize Deepgram ONLY when the first audio chunk arrives
             if dg_connection is None:
                 dg_connection = deepgram.listen.asyncwebsocket.v("1")
                 
                 async def on_message(self, result, **kwargs):
-                    nonlocal transcript_buffer  # 2. Let the handler modify our outside buffer
+                    nonlocal transcript_buffer, current_speaker # <-- Bring memory into the function
                     
                     sentence = result.channel.alternatives[0].transcript
-                    if not sentence:
+                    words = result.channel.alternatives[0].words
+
+                    if not sentence or not words:
                         return
 
-                    # 3. Only keep finalized text blocks
                     if result.is_final:
+                        # 1. Who is speaking right now?
+                        chunk_speaker = words[0].speaker
+
+                        # 2. INTERRUPT DETECTED: If it's a new speaker, and the buffer isn't empty
+                        if current_speaker is not None and chunk_speaker != current_speaker and transcript_buffer.strip():
+                            complete_paragraph = transcript_buffer.strip()
+                            dialogue_line = f"Speaker {current_speaker}: {complete_paragraph}"
+                            
+                            print(f"⚡ Interruption! Sending: {dialogue_line}")
+                            await text_queue.put(dialogue_line)
+                            
+                            # Wipe the buffer clean for the new speaker
+                            transcript_buffer = ""
+
+                        # 3. Update the memory and add words to the buffer
+                        current_speaker = chunk_speaker
                         transcript_buffer += sentence + " "
                         
-                        # 4. "speech_final" triggers when Deepgram detects the 800ms pause
+                        # 4. SILENCE DETECTED: 2 seconds of silence has passed
                         if result.speech_final:
                             complete_paragraph = transcript_buffer.strip()
                             if complete_paragraph:
-                                print(f"📝 Completed Paragraph: '{complete_paragraph}'")
-                                await text_queue.put(complete_paragraph)
-                            
-                            # 5. Reset the buffer for the next time they speak
+                                dialogue_line = f"Speaker {current_speaker}: {complete_paragraph}"
+                                
+                                print(f"📝 {dialogue_line}")
+                                await text_queue.put(dialogue_line)
+                                
+                            # Reset completely for whoever speaks next
                             transcript_buffer = ""
+                            current_speaker = None
 
                 dg_connection.on(LiveTranscriptionEvents.Transcript, on_message)
 
-                # 6. Add endpointing (silence detection) to your options
                 options = LiveOptions(
                     model="nova-2",
-                    language="en-US",
+                    language="en-IN",
                     smart_format=True,
-                    endpointing=800, # Wait for 800ms of silence before concluding the thought
+                    endpointing=1000,
+                    diarize=True,
                 )
                 
                 if await dg_connection.start(options) is False:
@@ -84,40 +107,56 @@ async def transcription_worker():
 
                 print("Deepgram connection established!")
 
-            # Send the actual audio data
             await dg_connection.send(audio_data)
             audio_queue.task_done()
 
     except asyncio.CancelledError:
         print("Shutting down Deepgram connection (CTRL+C)...")
         if dg_connection:
-            await dg_connection.finish()
+            try:
+                await asyncio.wait_for(dg_connection.finish(), timeout=2.0)
+            except Exception:
+                pass
+        raise
             
     except Exception as e:
         print(f"Transcription worker error: {e}")
-
 async def ai_logic_worker():
     """Pulls text, delegates to engine.py, and pushes the result to outbound_queue."""
+    debate_history = []  # Store the memory of the ENTIRE debate session
+    
     try:
         while True:
-            # 1. Wait for text to arrive
             text = await text_queue.get()
+            
+            # Handle session reset to wipe memory when "Stop Listening" is pressed
+            if text is None:
+                print("🧹 Stop Listening pressed: Wiping entire debate history for the next session.")
+                debate_history.clear()
+                text_queue.task_done()
+                continue
+                
             print(f"🧠 AI Worker evaluating: '{text}'...")
 
-            # 2. Process the text in its own isolated error block
             try:
-                result_json = await verify_claims(text)
+                # Pass the full history list to the engine
+                result_json = await verify_claims(text, debate_history)
                 print(f"✅ Verdict ready: {result_json['status']}")
+                
+                # Append this statement to the permanent session history
+                debate_history.append(text)
+                
+                # (Notice we removed the 5-item limit! It now stores EVERYTHING until Stop is pressed)
+                    
                 await outbound_queue.put(result_json)
             except Exception as e:
                 print(f"AI Worker error: {e}")
             finally:
-                # Only mark the task done if we successfully grabbed it from the queue
                 text_queue.task_done()
 
     except asyncio.CancelledError:
-        # 3. Catch the CTRL+C shutdown signal and exit instantly
         print("Shutting down AI Worker (CTRL+C)...")
+        raise
 
 # 3. The Lifespan Manager: Boots the workers alongside the server
 @asynccontextmanager

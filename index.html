@@ -248,66 +248,106 @@
   <script>
     let ws;
     let mediaRecorder;
-    const startBtn = document.getElementById("startBtn");
+    let stream;
+    let isListening = false;
+
+    const actionBtn = document.getElementById("startBtn");
     const statusDot = document.getElementById("statusDot");
     const statusText = document.getElementById("statusText");
     const cardsContainer = document.getElementById("cards-container");
     const emptyState = document.getElementById("emptyState");
 
-    startBtn.onclick = async () => {
-      // 1. Establish WebSocket Connection
-      const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-      ws = new WebSocket(`${protocol}//${window.location.host}/listen`);
+    // Cleanly shuts down the frontend recording and severs the connection
+    function stopEverything() {
+      if (mediaRecorder && mediaRecorder.state !== "inactive") {
+        mediaRecorder.stop();
+      }
+      if (stream) {
+        stream.getTracks().forEach(track => track.stop()); // Turns off the browser mic indicator
+      }
+      if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+        ws.close(); // Triggers the backend kill-signal to close Deepgram
+      }
 
-      ws.onopen = () => {
-        statusDot.classList.add("active");
-        statusText.innerText = "Status: Connected & Listening";
-      };
+      actionBtn.innerText = "Start Listening";
+      actionBtn.style.background = "#3b82f6"; // Back to blue
+      statusDot.classList.remove("active");
+      statusText.innerText = "Status: Disconnected";
+      isListening = false;
+    }
 
-      ws.onclose = () => {
-        statusDot.classList.remove("active");
-        statusText.innerText = "Status: Disconnected";
-        startBtn.disabled = false;
-      };
+    actionBtn.onclick = async () => {
+      // If we are already listening, act as a Stop button
+      if (isListening) {
+        stopEverything();
+        return;
+      }
 
-      // 2. Receive JSON Card from Backend
-      ws.onmessage = (event) => {
-        const data = JSON.parse(event.data);
+      try {
+        // 1. Request Microphone Access
+        stream = await navigator.mediaDevices.getUserMedia({ 
+          audio: {
+            noiseSuppression: true,
+            echoCancellation: true,
+            autoGainControl: true
+          } 
+        });
 
-        // Hide empty state placeholder on first result
-        if (emptyState) {
-          emptyState.remove();
-        }
+        // 2. Establish WebSocket Connection
+        const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+        ws = new WebSocket(`${protocol}//${window.location.host}/listen`);
 
-        // Create card element
-        const card = document.createElement("div");
-        const status = data.status ? data.status.toUpperCase() : "NUANCE";
-        card.className = `card ${status}`;
+        ws.onopen = () => {
+          statusDot.classList.add("active");
+          statusText.innerText = "Status: Connected & Listening";
+          actionBtn.innerText = "Stop Listening";
+          actionBtn.style.background = "#ef4444"; // Change to red to indicate Stop
+          isListening = true;
+        };
 
-        card.innerHTML = `
-          <div class="card-header">
-            <span class="verdict-tag">${status}</span>
-          </div>
-          <div class="claim-text">"${data.claim}"</div>
-          <div class="reason-text">${data.reason}</div>
-        `;
+        ws.onclose = () => {
+          stopEverything();
+        };
 
-        cardsContainer.prepend(card);
-      };
+        // 3. Receive JSON Card from Backend
+        ws.onmessage = (event) => {
+          const data = JSON.parse(event.data);
 
-      // 3. Request Microphone Access
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      mediaRecorder = new MediaRecorder(stream, { mimeType: "audio/webm" });
+          if (emptyState) {
+            emptyState.style.display = "none";
+          }
 
-      // 4. Send audio chunks to server every 1000ms
-      mediaRecorder.ondataavailable = (event) => {
-        if (event.data.size > 0 && ws.readyState === WebSocket.OPEN) {
-          ws.send(event.data);
-        }
-      };
+          const card = document.createElement("div");
+          const status = data.status ? data.status.toUpperCase() : "NUANCE";
+          card.className = `card ${status}`;
 
-      mediaRecorder.start(1000);
-      startBtn.disabled = true;
+          card.innerHTML = `
+            <div class="card-header">
+              <span class="verdict-tag">${status}</span>
+            </div>
+            <div class="claim-text">"${data.claim}"</div>
+            <div class="reason-text">${data.reason}</div>
+          `;
+
+          cardsContainer.prepend(card);
+        };
+
+        // 4. Send audio chunks to server every 1000ms
+        mediaRecorder = new MediaRecorder(stream, { mimeType: "audio/webm" });
+
+        mediaRecorder.ondataavailable = (event) => {
+          if (event.data.size > 0 && ws.readyState === WebSocket.OPEN) {
+            ws.send(event.data);
+          }
+        };
+
+        mediaRecorder.start(1000);
+
+      } catch (err) {
+        console.error("Error accessing microphone:", err);
+        alert("Could not access microphone. Please ensure permissions are granted.");
+        stopEverything();
+      }
     };
   </script>
 </body>
